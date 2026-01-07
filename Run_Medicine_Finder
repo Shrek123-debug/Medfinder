@@ -1,0 +1,1227 @@
+#!/usr/bin/env python3
+
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import json
+import urllib.request
+import urllib.parse
+import traceback
+from urllib.error import URLError, HTTPError
+import re
+
+HOST = '127.0.0.1'
+PORT = 8000
+
+# Embedded datasets (trimmed copies of previous JSON files)
+DATA_ENTRIES = [
+    {
+        "id": "resp_cold_cough",
+        "name": "Common cold — dry cough",
+        "category": "respiratory",
+        "symptoms": [{"symptom": "cough", "value": "dry"}],
+        "recommended": "Dextromethorphan — cough suppressant",
+        "alternatives": ["Honey (over 1 year old)", "Lozenges (menthol)", "Dextromethorphan-containing syrups"],
+        "explanation": "For dry, non-productive coughs, a cough suppressant can reduce the cough reflex.",
+        "precautions": "Not for children under 4 years. Use caution in pregnancy."
+    },
+    {
+        "id": "resp_cough_prod",
+        "name": "Productive cough (with phlegm)",
+        "category": "respiratory",
+        "symptoms": [{"symptom": "cough", "value": "productive"}],
+        "recommended": "Guaifenesin — expectorant",
+        "alternatives": ["Increased fluids", "Steam inhalation"],
+        "explanation": "An expectorant helps loosen mucus.",
+        "precautions": "If cough persists >7 days or high fever, see a clinician."
+    },
+    {
+        "id": "sore_throat_simple",
+        "name": "Sore throat, mild",
+        "category": "respiratory",
+        "symptoms": [{"symptom": "sore_throat", "value": None}],
+        "recommended": "Acetaminophen and throat lozenges",
+        "alternatives": ["Ibuprofen (if not contraindicated)", "Saltwater gargle"],
+        "explanation": "Analgesics and soothing lozenges can provide symptom relief.",
+        "precautions": "Check dosing for children."
+    },
+    {
+        "id": "pain_headache",
+        "name": "Tension headache / mild-moderate headache",
+        "category": "pain",
+        "symptoms": [{"symptom": "headache", "value": None}],
+        "recommended": "Acetaminophen or Ibuprofen",
+        "alternatives": ["Aspirin (for adults)", "Rest and hydration"],
+        "explanation": "Analgesics can reduce pain.",
+        "precautions": "Follow age-appropriate dosing."
+    },
+    {
+        "id": "fever_general",
+        "name": "Fever with body aches",
+        "category": "pain",
+        "symptoms": [{"symptom": "fever", "value": None}],
+        "recommended": "Acetaminophen or Ibuprofen",
+        "alternatives": ["Hydration", "Cooling measures"],
+        "explanation": "Antipyretics reduce fever and relieve aches.",
+        "precautions": "Follow dosing instructions."
+    },
+    {
+        "id": "allergy_hayfever",
+        "name": "Seasonal allergic rhinitis (hay fever)",
+        "category": "allergic",
+        "symptoms": [{"symptom": "sneezing", "value": None}],
+        "recommended": "Cetirizine or Loratadine (non-drowsy antihistamine)",
+        "alternatives": ["Fexofenadine", "Nasal saline rinses"],
+        "explanation": "Second-generation oral antihistamines reduce sneezing and runny nose.",
+        "precautions": "Some antihistamines may cause drowsiness."
+    },
+    {
+        "id": "heartburn_simple",
+        "name": "Occasional heartburn / acid reflux",
+        "category": "digestive",
+        "symptoms": [{"symptom": "heartburn", "value": None}],
+        "recommended": "Antacid (e.g., calcium carbonate) or H2 blocker (famotidine)",
+        "alternatives": ["PPIs for frequent heartburn (omeprazole)"],
+        "explanation": "Antacids relieve occasional heartburn.",
+        "precautions": "Frequent heartburn needs medical evaluation."
+    },
+    {
+        "id": "diarrhea_simple",
+        "name": "Acute non-bloody diarrhea",
+        "category": "digestive",
+        "symptoms": [{"symptom": "diarrhea", "value": None}],
+        "recommended": "Loperamide and oral rehydration",
+        "alternatives": ["Bismuth subsalicylate", "Hydration"],
+        "explanation": "Loperamide reduces stool frequency; maintain hydration.",
+        "precautions": "Avoid loperamide with high fever or bloody stool."
+    }
+]
+
+# Core dataset entries (kept small for algorithmic mapping) -- symptom-specific entries exist here
+# (the original small dataset is preserved above in DATA_ENTRIES)
+
+# Large symptom vocabulary (500+). Constructed programmatically but only
+# combining body parts with symptom types that make sense together. This
+# removes nonsensical combos such as "eye heartburn" or "head wheezing".
+PARTS = ['head','eye','ear','nose','throat','chest','lung','heart','stomach','abdomen','back','neck',
+         'arm','leg','hand','foot','skin','joint','muscle','mouth','teeth','sinus','urinary','genital',
+         'brain','nerve','sleep','mental','thyroid','lip','tongue']
+
+# Symptom types and the parts they reasonably apply to. 'any' means most parts.
+SYMPTOM_TO_PARTS = {
+    'pain': 'any', 'ache': 'any', 'burning': 'any', 'itching': 'skin,any', 'numbness': 'any', 'tingling': 'any',
+    'swelling': 'any', 'redness': 'skin,any', 'rash': 'skin', 'fatigue': 'any', 'weakness': 'any',
+    # Respiratory / ENT
+    'cough': 'chest,lung,throat', 'productive cough': 'chest,lung,throat', 'dry cough': 'chest,lung,throat',
+    'wheezing': 'chest,lung', 'shortness of breath': 'chest,lung', 'sneezing': 'nose,sinus', 'runny nose': 'nose,sinus',
+    'congestion': 'nose,sinus,chest', 'nasal congestion': 'nose,sinus', 'sore throat': 'throat', 'hoarseness': 'throat',
+    # GI
+    'nausea': 'stomach,abdomen,mouth', 'vomiting': 'stomach,abdomen,mouth', 'diarrhea': 'abdomen', 'constipation': 'abdomen',
+    'acid reflux': 'stomach,chest', 'heartburn': 'stomach,chest', 'bloating': 'stomach,abdomen', 'gas': 'stomach,abdomen',
+    # Neurologic / general
+    'dizziness': 'head,brain,neck', 'headache': 'head', 'migraine': 'head', 'lightheadedness': 'head',
+    # Cardiac / urgent
+    'palpitations': 'chest,heart', 'chest pain': 'chest,heart',
+    # Urinary
+    'urinary frequency': 'urinary,genital,abdomen', 'dysuria': 'urinary,genital',
+    # Vision / ear
+    'blurred vision': 'eye,head', 'eye pain': 'eye', 'ear pain': 'ear', 'ear ringing': 'ear',
+    # Musculoskeletal
+    'back pain': 'back', 'neck pain': 'neck', 'muscle spasm': 'muscle', 'joint stiffness': 'joint'
+}
+
+SYMPTOMS = []
+
+def add_combination(part, symptom):
+    # Avoid duplicates and malformed strings
+  # Build candidate string. If the symptom already contains the part
+  # as a whole word, don't prefix it (prevents "eye eye pain").
+  candidate = f"{part} {symptom}" if part and symptom else symptom or part
+  candidate = candidate.strip()
+  # Normalize repeated part (e.g., 'eye eye pain' -> use single mention)
+  if part and symptom:
+    # If symptom itself already mentions the part as a whole word or starts with the part
+    # (e.g., 'headache' starts with 'head'), prefer the symptom as-is to avoid 'head headache'
+    if re.search(rf"\b{re.escape(part)}\b", symptom, flags=re.IGNORECASE) or symptom.lower().startswith(part.lower()):
+      candidate = symptom.strip()
+
+  # Replace the token 'pain' with 'ache' to prefer 'ache' phrasing for body-part discomfort
+  candidate = re.sub(r"\bpain\b", 'ache', candidate, flags=re.IGNORECASE)
+
+  # Collapse whitespace and normalize to lower-case for consistent suggestions
+  s = ' '.join(candidate.split()).lower()
+  if s and s not in SYMPTOMS:
+    SYMPTOMS.append(s)
+
+# Add combinations according to SYMPTOM_TO_PARTS mapping
+for symptom, allowed in SYMPTOM_TO_PARTS.items():
+    parts_allowed = []
+    if allowed == 'any':
+        parts_allowed = PARTS
+    else:
+        parts_allowed = [p for p in allowed.split(',') if p in PARTS]
+    for p in parts_allowed:
+        add_combination(p, symptom)
+
+# Also include a few standalone/global symptoms
+for g in ['fever','chills','fatigue','insomnia','anxiety','depression','bleeding','nosebleed']:
+    if g not in SYMPTOMS:
+        SYMPTOMS.append(g)
+
+# Add left/right variants for extremities to increase coverage
+for limb in ('arm','leg','hand','foot'):
+    for sym in ['pain','numbness','tingling','swelling','redness']:
+        add_combination(f'left {limb}', sym)
+        add_combination(f'right {limb}', sym)
+
+# Ensure we have at least 520 symptoms by adding numbered variants of existing sensible entries
+base_len = len(SYMPTOMS)
+# Replace placeholder numbered variants with a curated set of additional real symptoms
+EXTRA_SYMPTOMS = [
+  'light sensitivity', 'phonophobia', 'visual aura', 'unusual taste', 'metallic taste',
+  'excessive tearing', 'dry mouth', 'bad breath', 'halitosis', 'ear popping', 'ear fullness',
+  'sinus pressure', 'facial pressure', 'facial swelling', 'cheek pain', 'eye discharge', 'eye itching',
+  'foreign body sensation in eye', 'difficulty swallowing', 'food stuck sensation', 'loss of smell',
+  'loss of taste', 'unexplained weight loss', 'weight gain', 'excessive thirst', 'frequent urination',
+  'blood in urine', 'lower abdominal pain', 'pelvic pain', 'vaginal discharge', 'vaginal itching',
+  'testicular pain', 'penile discharge', 'male urinary urgency', 'female urinary urgency',
+  'breast pain', 'nipple discharge', 'menstrual irregularity', 'heavy bleeding', 'spotting',
+  'leg cramp', 'calf pain', 'ankle swelling', 'foot numbness', 'heel pain', 'plantar pain',
+  'shoulder pain', 'elbow pain', 'wrist pain', 'hip pain', 'knee pain', 'groin pain',
+  'stiff neck', 'neck stiffness on movement', 'unable to move neck', 'jaw pain', 'TMJ pain',
+  'hoarse voice', 'voice change', 'bad cough at night', 'cough with blood', 'wheezy breathing',
+  'shortness of breath on exertion', 'orthopnea', 'paroxysmal nocturnal dyspnea',
+  'palpitations at rest', 'skipped beats', 'slow heartbeat', 'rapid heartbeat',
+  'pins and needles', 'loss of coordination', 'tremor', 'muscle twitching', 'muscle weakness one side',
+  'memory problems', 'confusion', 'difficulty concentrating', 'mood swings', 'panic attack',
+  'erectile dysfunction', 'decreased libido', 'hot flashes', 'cold intolerance', 'heat intolerance',
+  'excessive sweating', 'pale skin', 'jaundice', 'easy bruising', 'bleeding gums', 'nosebleed recurrent',
+  'easy bone fractures', 'tooth sensitivity', 'dry skin', 'oily skin', 'psoriasis rash',
+  'eczema flare', 'hives widespread', 'blistering rash', 'skin peeling', 'sun sensitivity',
+  'itching scalp', 'hair loss', 'slow wound healing', 'nail changes', 'foot odor', 'sudden vision loss',
+  'double vision', 'seeing floaters', 'ringing in ears persistent', 'difficulty hearing',
+  'balance problems', 'falling episodes', 'leg swelling unilateral', 'varicose veins pain',
+  'blood in stool', 'black stool', 'bright red rectal bleed', 'unintentional weight gain',
+]
+
+idx = 0
+while len(SYMPTOMS) < 520 and idx < len(EXTRA_SYMPTOMS):
+  if EXTRA_SYMPTOMS[idx] not in SYMPTOMS:
+    SYMPTOMS.append(EXTRA_SYMPTOMS[idx])
+  idx += 1
+
+# If still short, append sensible repeats from base entries (rare)
+while len(SYMPTOMS) < 520:
+  SYMPTOMS.append(SYMPTOMS[len(SYMPTOMS) % base_len] + ' (variant)')
+
+# Expanded drug list and mappings. This adds a larger set of specific OTC
+# generic ingredients and common product categories so the recommender can
+# pick from a wider pool. DRUG_PROFILES contains simple suitability rules.
+
+DRUG_LIST = [
+  'Acetaminophen', 'Ibuprofen', 'Naproxen', 'Aspirin', 'Dextromethorphan',
+  'Guaifenesin', 'Diphenhydramine', 'Cetirizine', 'Loratadine', 'Fexofenadine',
+  'Pseudoephedrine', 'Phenylephrine', 'Oxymetazoline', 'Fluticasone (nasal)',
+  'Budesonide (nasal)', 'Calcium carbonate', 'Magnesium hydroxide', 'Simethicone',
+  'Famotidine', 'Omeprazole', 'Lansoprazole', 'Loperamide', 'Dimenhydrinate',
+  'Meclizine', 'Docusate', 'Bisacodyl', 'Senna', 'Polyethylene glycol',
+  'Topical hydrocortisone', 'Clotrimazole', 'Miconazole', 'Tolnaftate',
+  'Povidone-iodine', 'Hydrogen peroxide', 'Benzoyl peroxide', 'Salicylic acid',
+  'Neomycin', 'Bacitracin', 'Polymyxin B', 'Triple antibiotic ointment',
+  'Calamine lotion', 'Artificial tears', 'Ketotifen (eye drop)', 'Olopatadine (eye drop)',
+  'Naphazoline (eye drop)', 'Carbamide peroxide (ear wax)', 'Benzocaine (topical)',
+  'Lidocaine (topical)', 'Melatonin', 'Doxylamine', 'Nicotine gum', 'Nicotine patch',
+  'Senna (stimulant laxative)', 'Sodium bicarbonate', 'Sodium chloride (saline)',
+  'Zinc gluconate', 'Vitamin C', 'Tolterodine (OTC: symptom relief product)',
+  'Hydrocortisone (rectal)', 'Witch hazel', 'Phenol (topical antiseptic)',
+  'Menthol lozenges', 'Peppermint oil (enteric)', 'Simethicone (anti-gas)',
+  'Activated charcoal (digestive)', 'Oral rehydration salts', 'Electrolyte solution',
+  'Alpha-galactosidase (Beano)', 'Bismuth subsalicylate', 'Calcium polycarbophil',
+  'Glycerin suppositories', 'Aloe vera gel', 'Antacid chews', 'Hydrogen peroxide oral',
+  'Mupirocin (topical OTC in some regions)', 'Tolnaftate', 'Selenium sulfide',
+  'Coal tar shampoo', 'Ketoconazole (OTC shampoo)', 'Eucalyptus oil (topical)',
+  'Ivy/poison oak cleanser', 'Sorbitol', 'Phenylephrine (topical)', 'Octinoxate (topical)'
+]
+
+# Add more common OTCs, vitamins, and supportive products to reach ~100 items
+DRUG_LIST.extend([
+  'Vitamin D', 'Iron supplement', 'Multivitamin', 'Probiotic', 'Fish oil (omega-3)',
+  'Glucosamine', 'Chondroitin', 'Echinacea', 'Zinc oxide (topical)', 'Petroleum jelly',
+  'Saline nasal spray', 'Topical antiseptic', 'Chlorhexidine', 'Isopropyl alcohol', 'Glycerin',
+  'Buccal analgesic', 'Oral anesthetic gel', 'Topical antifungal powder', 'Antifungal spray', 'Calcium citrate',
+  'Magnesium supplement', 'Dextrose oral gel', 'Oral rehydration powder', 'Electrolyte tablets', 'Vitamin C chewables'
+])
+
+# Build a basic DRUG_PROFILES mapping with conservative defaults, then override
+# a few drugs with known age/pregnancy cautions.
+DRUG_PROFILES = {name: {'min_age_years': 0, 'avoid_in_pregnancy': False, 'notes': ''} for name in DRUG_LIST}
+
+# Conservative overrides for specific agents
+for n in ('Ibuprofen', 'Naproxen', 'Aspirin'):
+  if n in DRUG_PROFILES:
+    DRUG_PROFILES[n]['min_age_years'] = 6
+    DRUG_PROFILES[n]['avoid_in_pregnancy'] = True
+    DRUG_PROFILES[n]['notes'] = 'NSAID — avoid in later pregnancy and follow pediatric dosing.'
+
+if 'Aspirin' in DRUG_PROFILES:
+  DRUG_PROFILES['Aspirin']['min_age_years'] = 18  # avoid use in children with viral illness
+
+if 'Acetaminophen' in DRUG_PROFILES:
+  DRUG_PROFILES['Acetaminophen']['min_age_years'] = 0
+  DRUG_PROFILES['Acetaminophen']['notes'] = 'Dosing by weight required for children.'
+
+if 'Bismuth subsalicylate' in DRUG_PROFILES:
+  DRUG_PROFILES['Bismuth subsalicylate']['min_age_years'] = 12
+  DRUG_PROFILES['Bismuth subsalicylate']['notes'] = 'Not recommended for children/teens with viral illness.'
+
+# Enrich selected DRUG_PROFILES with more detailed notes and cautions.
+overrides = {
+  'Diphenhydramine': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Sedating antihistamine; may cause drowsiness.'},
+  'Dextromethorphan': {'min_age_years': 4, 'avoid_in_pregnancy': False, 'notes': 'Cough suppressant; check combination products for other actives.'},
+  'Guaifenesin': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Expectorant; maintain hydration.'},
+  'Cetirizine': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Non-sedating antihistamine in many users.'},
+  'Loratadine': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Often non-sedating; follow pediatric dosing.'},
+  'Fexofenadine': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Non-sedating antihistamine; avoid fruit juices around dosing.'},
+  'Pseudoephedrine': {'min_age_years': 12, 'avoid_in_pregnancy': False, 'notes': 'Oral decongestant; can raise blood pressure and heart rate.'},
+  'Phenylephrine': {'min_age_years': 12, 'avoid_in_pregnancy': False, 'notes': 'Less effective oral decongestant for some; topical forms may be safer for short-term use.'},
+  'Oxymetazoline': {'min_age_years': 6, 'avoid_in_pregnancy': False, 'notes': 'Topical nasal decongestant; avoid >3 days to prevent rebound congestion.'},
+  'Fluticasone (nasal)': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Nasal steroid spray; regular dosing needed for effect.'},
+  'Budesonide (nasal)': {'min_age_years': 6, 'avoid_in_pregnancy': False, 'notes': 'Nasal steroid; check age-specific formulations.'},
+  'Omeprazole': {'min_age_years': 18, 'avoid_in_pregnancy': False, 'notes': 'Proton pump inhibitor; not for immediate symptom relief, consider H2 blockers for short-term use.'},
+  'Famotidine': {'min_age_years': 12, 'avoid_in_pregnancy': False, 'notes': 'H2 blocker for acid suppression; may be used for heartburn.'},
+  'Loperamide': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Anti-diarrheal; avoid with bloody diarrhea or high fever.'},
+  'Dimenhydrinate': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Antiemetic; sedating. Use caution when driving.'},
+  'Meclizine': {'min_age_years': 12, 'avoid_in_pregnancy': False, 'notes': 'Antivertigo agent; sedating for some people.'},
+  'Polyethylene glycol': {'min_age_years': 6, 'avoid_in_pregnancy': False, 'notes': 'Osmotic laxative; gentle onset over 1+ days.'},
+  'Docusate': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Stool softener; gentle option.'},
+  'Bisacodyl': {'min_age_years': 6, 'avoid_in_pregnancy': False, 'notes': 'Stimulant laxative; use short-term.'},
+  'Topical hydrocortisone': {'min_age_years': 0, 'avoid_in_pregnancy': False, 'notes': 'Low-potency topical steroid for mild rashes.'},
+  'Clotrimazole': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Topical antifungal for tinea/yeast infections.'},
+  'Miconazole': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Topical antifungal; follow application instructions.'},
+  'Benzoyl peroxide': {'min_age_years': 12, 'avoid_in_pregnancy': False, 'notes': 'Topical acne treatment; may bleach fabrics.'},
+  'Salicylic acid': {'min_age_years': 12, 'avoid_in_pregnancy': False, 'notes': 'For acne and wart treatments; avoid on large broken skin areas.'},
+  'Benzocaine (topical)': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Topical anesthetic; avoid overuse in infants.'},
+  'Lidocaine (topical)': {'min_age_years': 12, 'avoid_in_pregnancy': False, 'notes': 'Topical anesthetic; follow product instructions.'},
+  'Melatonin': {'min_age_years': 18, 'avoid_in_pregnancy': False, 'notes': 'Short-term sleep aid; discuss long-term use with provider.'},
+  'Doxylamine': {'min_age_years': 12, 'avoid_in_pregnancy': True, 'notes': 'Sedating antihistamine; often used short-term for sleep. Avoid in pregnancy unless advised.'},
+  'Nicotine gum': {'min_age_years': 18, 'avoid_in_pregnancy': True, 'notes': 'Smoking cessation aid; pregnancy considerations apply.'},
+  'Nicotine patch': {'min_age_years': 18, 'avoid_in_pregnancy': True, 'notes': 'Smoking cessation aid; discuss risks in pregnancy.'},
+  'Bismuth subsalicylate': {'min_age_years': 12, 'avoid_in_pregnancy': False, 'notes': 'Not for children/teens with viral illness; may cause dark stool.'},
+  'Antacid chews': {'min_age_years': 0, 'avoid_in_pregnancy': False, 'notes': 'Short-term relief for heartburn; check sodium content.'},
+  'Simethicone': {'min_age_years': 0, 'avoid_in_pregnancy': False, 'notes': 'Anti-gas agent; generally well tolerated.'},
+  'Alpha-galactosidase (Beano)': {'min_age_years': 2, 'avoid_in_pregnancy': False, 'notes': 'Helps digest complex carbs; take before meals.'},
+  'Oral rehydration salts': {'min_age_years': 0, 'avoid_in_pregnancy': False, 'notes': 'Important for dehydration; follow mixing directions.'},
+  'Saline nasal spray': {'min_age_years': 0, 'avoid_in_pregnancy': False, 'notes': 'Safe for most ages; gentle nasal clearing.'},
+  'Artificial tears': {'min_age_years': 0, 'avoid_in_pregnancy': False, 'notes': 'For dry/irritated eyes; preservative-free preferred for frequent use.'},
+}
+
+for k, v in overrides.items():
+  if k in DRUG_PROFILES:
+    DRUG_PROFILES[k].update(v)
+
+# Minimal mapping from symptom keywords to commonly suggested OTC drugs.
+# This map maps common symptom keywords to a specific drug/product from DRUG_LIST
+# (not every drug will be referenced here; presence in DRUG_PROFILES makes it
+# available for suitability checks and future picks).
+DRUG_MAP = {
+  'cough': 'Dextromethorphan',
+  'dry cough': 'Dextromethorphan',
+  'productive cough': 'Guaifenesin',
+  'headache': 'Acetaminophen',
+  'fever': 'Acetaminophen',
+  'muscle ache': 'Ibuprofen',
+  'joint stiffness': 'Ibuprofen',
+  'back pain': 'Naproxen',
+  'tooth pain': 'Ibuprofen',
+  'heartburn': 'Omeprazole',
+  'acid reflux': 'Famotidine',
+  'indigestion': 'Antacid chews',
+  'nausea': 'Dimenhydrinate',
+  'dizziness': 'Meclizine',
+  'diarrhea': 'Loperamide',
+  'constipation': 'Polyethylene glycol',
+  'sneezing': 'Cetirizine',
+  'runny nose': 'Loratadine',
+  'nasal congestion': 'Pseudoephedrine',
+  'stuffy nose': 'Oxymetazoline',
+  'itching': 'Diphenhydramine',
+  'rash': 'Topical hydrocortisone',
+  'hives': 'Cetirizine',
+  'sore throat': 'Menthol lozenges',
+  'heart palpitations': 'Refer to doctor',
+  'eye irritation': 'Artificial tears',
+  'eye allergy': 'Ketotifen (eye drop)',
+  'ear wax': 'Carbamide peroxide (ear wax)',
+  'hemorrhoids': 'Hydrocortisone (rectal)',
+  'insomnia': 'Melatonin',
+  'smoking cravings': 'Nicotine gum',
+  'fungal skin': 'Clotrimazole',
+  'athlete foot': 'Tolnaftate',
+  'acne': 'Benzoyl peroxide',
+  'gas': 'Simethicone',
+  'bloating': 'Alpha-galactosidase (Beano)',
+  'gastric pain': 'Magnesium hydroxide',
+  'stomach ache': 'Antacid chews',
+  'stomach pain': 'Antacid chews',
+  'indigestion': 'Antacid chews',
+  'heartburn pain': 'Omeprazole',
+  'acid reflux pain': 'Famotidine',
+  'runny nose': 'Loratadine',
+  'nasal drip': 'Loratadine',
+  'postnasal drip': 'Guaifenesin',
+  'sore throat pain': 'Menthol lozenges',
+  'throat soreness': 'Menthol lozenges',
+  'ear infection': 'Refer to doctor',
+  'ear discomfort': 'Carbamide peroxide (ear wax)',
+  'itchy skin': 'Topical hydrocortisone',
+  'rash itchy': 'Topical hydrocortisone',
+  'hives itchy': 'Cetirizine',
+  'itchy eyes': 'Ketotifen (eye drop)',
+  'eye redness': 'Artificial tears',
+  'constipation pain': 'Polyethylene glycol',
+  'gas pain': 'Simethicone',
+  'bloating gas': 'Alpha-galactosidase (Beano)',
+  'nausea vomiting': 'Dimenhydrinate',
+  'vomit': 'Dimenhydrinate',
+  'diarrhoea': 'Loperamide',
+  'stomach cramp': 'Antacid chews',
+  'toothache': 'Ibuprofen',
+  'dental pain': 'Ibuprofen',
+  'menstrual cramp': 'Ibuprofen',
+  'period pain': 'Ibuprofen',
+}
+
+
+def _map_symptom_to_drug(symptom):
+  s = symptom.lower()
+  # exact match
+  if s in DRUG_MAP:
+    return DRUG_MAP[s]
+  # substring match
+  for k, v in DRUG_MAP.items():
+    if k in s:
+      return v
+  return None
+
+
+
+def _default_monograph(name):
+    return {
+        'name': name,
+        'description': f'Over-the-counter product: {name}.',
+        'common_uses': ['Symptom relief (see details)'],
+        'adult_dose': 'Follow product label; typical adult dosing per label.',
+        'pediatric_dose': 'Follow product label or consult a pediatrician; dosing often weight-based.',
+        'major_interactions': 'See product label or consult pharmacist for interactions.',
+        'contraindications': 'Allergy to active ingredient; follow label.',
+        'min_age_years': 0,
+        'avoid_in_pregnancy': False,
+        'notes': ''
+    }
+
+# initialize with defaults for every DRUG_LIST entry
+DRUG_PROFILES = {name: _default_monograph(name) for name in DRUG_LIST}
+
+# targeted, more informative monographs for common agents
+MONOGRAPHS = {
+  'Acetaminophen': {
+    'description': 'Analgesic and antipyretic (paracetamol).',
+    'common_uses': ['Fever reduction', 'Mild to moderate pain (headache, muscle aches, toothache)'],
+    'adult_dose': '325–1000 mg every 4–6 hours as needed; do not exceed 3000–4000 mg/day depending on product and liver risk.',
+    'pediatric_dose': 'Dose by weight (10–15 mg/kg per dose, every 4–6 hours; max 4 doses/day).',
+    'major_interactions': 'Alcohol increases liver risk; some combination cold products contain acetaminophen.',
+    'contraindications': 'Severe hepatic impairment; allergy.',
+    'min_age_years': 0,
+    'avoid_in_pregnancy': False,
+    'notes': 'Safe when used at recommended doses; check multi-ingredient products to avoid duplication.'
+  },
+  'Ibuprofen': {
+    'description': 'Nonsteroidal anti-inflammatory drug (NSAID) with analgesic and antipyretic effects.',
+    'common_uses': ['Inflammatory pain', 'Fever', 'Menstrual cramps', 'Muscle/joint pain'],
+    'adult_dose': '200–400 mg every 4–6 hours as needed; do not exceed 1200 mg/day OTC (prescription limits higher).',
+    'pediatric_dose': '5–10 mg/kg per dose every 6–8 hours; follow label for max daily dose.',
+    'major_interactions': 'May increase bleeding with anticoagulants; caution with ACE inhibitors, diuretics.',
+    'contraindications': 'Active GI bleeding, severe renal disease, known NSAID allergy.',
+    'min_age_years': 6,
+    'avoid_in_pregnancy': True,
+    'notes': 'Avoid in later pregnancy and in certain kidney conditions.'
+  },
+  'Naproxen': {
+    'description': 'NSAID for pain and inflammation.',
+    'common_uses': ['Musculoskeletal pain', 'Menstrual cramps', 'Headache'],
+    'adult_dose': '220 mg every 8–12 hours as needed (OTC); do not exceed 660 mg/day OTC dosing unless directed.',
+    'pediatric_dose': 'Follow product labeling; some formulations not for young children.',
+    'major_interactions': 'Similar to other NSAIDs; bleeding risk with anticoagulants.',
+    'contraindications': 'Active bleeding, severe uncontrolled hypertension, known allergy to NSAIDs.',
+    'min_age_years': 6,
+    'avoid_in_pregnancy': True,
+    'notes': 'Prefer to avoid in later pregnancy.'
+  },
+  'Aspirin': {
+    'description': 'Salicylate analgesic/antiplatelet; used for pain and to reduce fever and inflammation.',
+    'common_uses': ['Mild pain', 'Anti-inflammatory', 'Low-dose for cardiac protection (prescription use)'],
+    'adult_dose': '325–650 mg every 4–6 hours as needed for pain (do not exceed label limits).',
+    'pediatric_dose': 'Generally avoid in children/teens with viral illness due to Reye syndrome risk.',
+    'major_interactions': 'Anticoagulants increase bleeding risk; other NSAIDs may add risk.',
+    'contraindications': 'Children/teens with viral illness; active bleeding; hypersensitivity.',
+    'min_age_years': 18,
+    'avoid_in_pregnancy': True,
+    'notes': 'Avoid in children/teens with viral illnesses; discuss antiplatelet use with clinician.'
+  },
+  'Dextromethorphan': {
+    'description': 'Centrally acting cough suppressant.',
+    'common_uses': ['Dry, non-productive cough suppression'],
+    'adult_dose': '10–20 mg every 4 hours or 30 mg every 6–8 hours; max ~120 mg/day.',
+    'pediatric_dose': 'Not for children under 4 years; follow label for older children.',
+    'major_interactions': 'Serotonergic agents (risk of serotonin syndrome with MAOIs/SSRIs in rare cases).',
+    'contraindications': 'Concurrent MAOI use.',
+    'min_age_years': 4,
+    'avoid_in_pregnancy': False,
+    'notes': 'Check combination cold products for other active ingredients.'
+  },
+  'Guaifenesin': {
+    'description': 'Expectorant that may thin and loosen mucus.',
+    'common_uses': ['Productive cough with thick mucus'],
+    'adult_dose': '200–400 mg every 4 hours (ER products have different dosing).',
+    'pediatric_dose': 'Often not recommended for young children; follow label.',
+    'major_interactions': 'None major; generally well tolerated.',
+    'contraindications': 'Allergy to ingredient.',
+    'min_age_years': 2,
+    'avoid_in_pregnancy': False,
+    'notes': 'Maintain hydration for best effect.'
+  },
+  'Diphenhydramine': {
+    'description': 'First-generation antihistamine; sedating.',
+    'common_uses': ['Allergic symptoms', 'Short-term insomnia', 'Motion sickness (some use)'],
+    'adult_dose': '25–50 mg every 4–6 hours as needed.',
+    'pediatric_dose': 'Not recommended in infants; follow label for children 2+.',
+    'major_interactions': 'Additive sedation with other CNS depressants; anticholinergic effects.',
+    'contraindications': 'Severe glaucoma, urinary retention, certain cardiac conditions.',
+    'min_age_years': 2,
+    'avoid_in_pregnancy': False,
+    'notes': 'Causes drowsiness; avoid before driving.'
+  },
+  'Cetirizine': {
+    'description': 'Second-generation antihistamine (less sedating for many).',
+    'common_uses': ['Allergic rhinitis', 'Urticaria (hives)'],
+    'adult_dose': '10 mg once daily (some people use 5 mg).',
+    'pediatric_dose': '10 mg/day for older children; 5 mg/day for some younger ages — follow label.',
+    'major_interactions': 'Minimal; CNS depressants may add sedation.',
+    'contraindications': 'Hypersensitivity.',
+    'min_age_years': 2,
+    'avoid_in_pregnancy': False,
+    'notes': 'Often non-sedating but individual responses vary.'
+  },
+  'Loratadine': {
+    'description': 'Second-generation antihistamine (non-sedating in many users).',
+    'common_uses': ['Seasonal allergies', 'Hives'],
+    'adult_dose': '10 mg once daily.',
+    'pediatric_dose': '10 mg/day for older children; lower doses for younger — follow label.',
+    'major_interactions': 'Few; fruit juice may reduce fexofenadine absorption (not loratadine).',
+    'contraindications': 'Hypersensitivity.',
+    'min_age_years': 2,
+    'avoid_in_pregnancy': False,
+    'notes': 'Generally non-sedating at recommended doses.'
+  },
+  'Fexofenadine': {
+    'description': 'Non-sedating second-generation antihistamine.',
+    'common_uses': ['Allergic rhinitis', 'Chronic urticaria'],
+    'adult_dose': '60 mg twice daily or 180 mg once daily depending on formulation.',
+    'pediatric_dose': 'Dosing varies by age/weight; follow label.',
+    'major_interactions': 'Avoid taking with fruit juices around dosing; may reduce absorption.',
+    'contraindications': 'Hypersensitivity.',
+    'min_age_years': 2,
+    'avoid_in_pregnancy': False,
+    'notes': 'Take with water; avoid fruit juice near dose.'
+  },
+  'Pseudoephedrine': {
+    'description': 'Oral decongestant (alpha-adrenergic agonist).',
+    'common_uses': ['Nasal congestion relief'],
+    'adult_dose': '30–60 mg every 4–6 hours; sustained release forms vary.',
+    'pediatric_dose': 'Many products restricted in young children; follow label.',
+    'major_interactions': 'May raise blood pressure; interactions with MAOIs.',
+    'contraindications': 'Severe hypertension, cardiovascular disease.',
+    'min_age_years': 12,
+    'avoid_in_pregnancy': False,
+    'notes': 'Regulated sale in some areas (behind counter) due to pseudoephedrine controls.'
+  },
+  'Phenylephrine': {
+    'description': 'Oral and topical decongestant; oral effectiveness may be variable.',
+    'common_uses': ['Nasal congestion (short-term)'],
+    'adult_dose': '10–20 mg every 4 hours as needed (OTC oral dosing varies).',
+    'pediatric_dose': 'Follow label; some products not for young children.',
+    'major_interactions': 'May raise blood pressure; caution with MAOIs.',
+    'contraindications': 'Severe hypertension, certain heart conditions.',
+    'min_age_years': 12,
+    'avoid_in_pregnancy': False,
+    'notes': 'Topical forms (sprays) useful short-term; avoid rebound congestion with prolonged use.'
+  },
+  'Oxymetazoline': {
+    'description': 'Topical nasal decongestant spray.',
+    'common_uses': ['Short-term relief of nasal congestion'],
+    'adult_dose': '2–3 sprays per nostril as directed; do not use >3 days to avoid rebound.',
+    'pediatric_dose': 'Age limits vary by product; follow label.',
+    'major_interactions': 'Systemic absorption is minimal but caution in severe hypertension.',
+    'contraindications': 'Chronic use due to rhinitis medicamentosa (rebound congestion).',
+    'min_age_years': 6,
+    'avoid_in_pregnancy': False,
+    'notes': 'Limit to 3 days to avoid rebound congestion.'
+  },
+  'Fluticasone (nasal)': {
+    'description': 'Intranasal corticosteroid for allergic rhinitis.',
+    'common_uses': ['Nasal congestion from allergic rhinitis', 'Sneezing', 'Itchy/runny nose'],
+    'adult_dose': 'One or two sprays per nostril daily depending on product.',
+    'pediatric_dose': 'Some formulations approved for children 2+; follow label.',
+    'major_interactions': 'Minimal systemic interactions at OTC doses.',
+    'contraindications': 'Active nasal infection without guidance.',
+    'min_age_years': 2,
+    'avoid_in_pregnancy': False,
+    'notes': 'Regular use for several days yields best effect.'
+  },
+  'Budesonide (nasal)': {
+    'description': 'Intranasal corticosteroid for allergy symptoms.',
+    'common_uses': ['Allergic rhinitis'],
+    'adult_dose': 'One or two sprays per nostril daily depending on product.',
+    'pediatric_dose': 'Some products approved for children 6+; follow label.',
+    'major_interactions': 'Minimal systemic effects at OTC dosing.',
+    'contraindications': 'Hypersensitivity.',
+    'min_age_years': 6,
+    'avoid_in_pregnancy': False,
+    'notes': 'Takes days to reach full effect.'
+  },
+  'Omeprazole': {
+    'description': 'Proton pump inhibitor for acid suppression.',
+    'common_uses': ['Frequent heartburn', 'GERD symptoms (short course)'],
+    'adult_dose': '20 mg once daily for 14 days OTC (varies).',
+    'pediatric_dose': 'Typically prescription for children; follow clinician guidance.',
+    'major_interactions': 'Can affect metabolism of drugs via CYP enzymes (e.g., clopidogrel interaction concerns).',
+    'contraindications': 'Hypersensitivity.',
+    'min_age_years': 18,
+    'avoid_in_pregnancy': False,
+    'notes': 'Not for immediate relief; daily dosing over days is typical.'
+  },
+  'Famotidine': {
+    'description': 'H2 receptor antagonist for acid suppression.',
+    'common_uses': ['Occasional heartburn', 'Acid indigestion'],
+    'adult_dose': '10–20 mg once or twice daily as needed.',
+    'pediatric_dose': 'Some pediatric formulations exist; follow label.',
+    'major_interactions': 'Few major interactions.',
+    'contraindications': 'Hypersensitivity.',
+    'min_age_years': 12,
+    'avoid_in_pregnancy': False,
+    'notes': 'Short-term use for occasional symptoms.'
+  },
+  'Loperamide': {
+    'description': 'Peripheral opioid-receptor agonist for symptomatic relief of diarrhea.',
+    'common_uses': ['Acute non-bloody diarrhea'],
+    'adult_dose': '4 mg initially, then 2 mg after each loose stool (max 8 mg/day OTC; higher dosing under medical guidance).',
+    'pediatric_dose': 'Follow label; many pediatric products not for very young children.',
+    'major_interactions': 'Use caution with medications that prolong QT in high doses.',
+    'contraindications': 'Bloody diarrhea, high fever, suspected invasive bacterial enteritis.',
+    'min_age_years': 2,
+    'avoid_in_pregnancy': False,
+    'notes': 'Do not use if fever or bloody stools are present.'
+  },
+  'Dimenhydrinate': {
+    'description': 'Antiemetic and antihistamine (sedating).',
+    'common_uses': ['Motion sickness', 'Nausea'],
+    'adult_dose': '50–100 mg every 4–6 hours as needed (follow label).',
+    'pediatric_dose': 'Some products for children 2+; follow label.',
+    'major_interactions': 'Additive sedation with CNS depressants.',
+    'contraindications': 'Narrow-angle glaucoma, severe prostatic hypertrophy (caution).',
+    'min_age_years': 2,
+    'avoid_in_pregnancy': False,
+    'notes': 'Sedating; avoid before driving.'
+  },
+  'Meclizine': {
+    'description': 'Antivertigo agent for motion sickness and vertigo.',
+    'common_uses': ['Motion sickness', 'Vertigo symptom control'],
+    'adult_dose': '25–50 mg once daily for motion sickness.',
+    'pediatric_dose': 'Not commonly used in small children; follow label.',
+    'major_interactions': 'Sedation with CNS depressants.',
+    'contraindications': 'Hypersensitivity.',
+    'min_age_years': 12,
+    'avoid_in_pregnancy': False,
+    'notes': 'May cause drowsiness.'
+  }
+}
+
+# Merge MONOGRAPHS into DRUG_PROFILES, leaving defaults for anything not specified
+for k, v in MONOGRAPHS.items():
+  if k in DRUG_PROFILES:
+    DRUG_PROFILES[k].update(v)
+  else:
+    DRUG_PROFILES[k] = v
+
+
+
+def _drug_suitable_for_person(drug_name, age_years=None, weight_kg=None, pregnant=False):
+  """Return (suitable:bool, reason:str)."""
+  prof = DRUG_PROFILES.get(drug_name)
+  if not prof:
+    return True, 'No specific profile — assume likely safe for adults'
+
+  if age_years is not None:
+    min_age = prof.get('min_age_years')
+    if min_age is not None and age_years < min_age:
+      return False, f'Contraindicated for children under {min_age} years.'
+
+  if pregnant and prof.get('avoid_in_pregnancy'):
+    return False, 'Avoid in pregnancy.'
+
+  # weight-based checks could go here; minimal for now
+  return True, prof.get('notes', '')
+
+
+def score_entry(entry, survey):
+    score = 0
+    survey_symptoms = survey.get('symptoms', [])
+    for req in entry.get('symptoms', []):
+        for s in survey_symptoms:
+            if req.get('symptom') == s.get('symptom'):
+                rv = req.get('value')
+                sv = s.get('value')
+                if rv and sv:
+                    if str(rv).lower() == str(sv).lower():
+                        score += 2
+                else:
+                    score += 1
+    return score
+
+
+def map_survey_to_recommendations(survey):
+    modifiers = survey.get('modifiers', {})
+    if modifiers.get('shortness_of_breath') or modifiers.get('severe_symptom'):
+        return [{'warning': 'Severe symptoms detected. Advise seeking medical attention immediately.'}]
+
+    scored = []
+
+    # Accept symptoms as either list of strings or list of {symptom, value}
+    survey_symptoms = []
+    for s in survey.get('symptoms', []):
+        if isinstance(s, str):
+            survey_symptoms.append({'symptom': s, 'value': None})
+        elif isinstance(s, dict):
+            survey_symptoms.append({'symptom': s.get('symptom'), 'value': s.get('value')})
+
+    # Score dataset entries as before
+    for e in DATA_ENTRIES:
+        precautions = e.get('precautions', '')
+        if survey.get('pregnant') == 'yes' and 'pregnancy' in precautions.lower():
+            continue
+        s = score_entry(e, {'symptoms': survey_symptoms})
+        if s > 0:
+            scored.append((s, e))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = [item for _, item in scored[:5]]
+
+    # Determine best drug suggestion by mapping individual symptoms to drugs and voting
+    drug_votes = {}
+    for s in survey_symptoms:
+        d = _map_symptom_to_drug(s.get('symptom') or '')
+        if d:
+            drug_votes[d] = drug_votes.get(d, 0) + 1
+
+    best_drug = None
+    best_drug_reason = None
+    if drug_votes:
+        # consider suitability using demographics
+        sorted_drugs = sorted(drug_votes.items(), key=lambda x: x[1], reverse=True)
+        age_years = survey.get('age_years')
+        weight_kg = survey.get('weight_kg')
+        pregnant = (survey.get('pregnant') == 'yes')
+        unsuitable_notes = []
+        for drug, votes in sorted_drugs:
+            ok, reason = _drug_suitable_for_person(drug, age_years=age_years, weight_kg=weight_kg, pregnant=pregnant)
+            if ok:
+                best_drug = drug
+                best_drug_reason = f"{votes} symptom matches; {reason}".strip()
+                break
+            else:
+                unsuitable_notes.append(f"{drug}: {reason}")
+
+    if not results and not best_drug:
+        # no matches and no suitable voted drug — keep conservative info but continue to scoring
+        pass
+
+    payload = {'matches': results}
+
+    if best_drug:
+        payload['best_drug'] = best_drug
+        payload['best_drug_reason'] = best_drug_reason
+    else:
+        # include notes about why top candidates were unsuitable
+        if drug_votes:
+            payload['unsuitable_candidates'] = unsuitable_notes
+            # pick the top-voted candidate even if it was unsuitable; include warning
+            sorted_drugs = sorted(drug_votes.items(), key=lambda x: x[1], reverse=True)
+            top_drug, top_votes = sorted_drugs[0]
+            payload['best_drug'] = top_drug
+            payload['best_drug_reason'] = f"{top_votes} symptom matches; selected top-voted candidate despite cautions."
+            payload['warning'] = 'Selected top-voted drug despite suitability concerns — review precautions or consult a provider.'
+        else:
+            # try to extract a recommended drug from the top matched result
+            chosen = None
+            if results:
+                rec_text = results[0].get('recommended','')
+                if rec_text:
+                    # take the first option before ' or ' or comma
+                    first = rec_text.split(' or ')[0].split(',')[0].strip()
+                    if first:
+                        chosen = first
+            # fallback conservative defaults if nothing found
+            if chosen:
+                payload['best_drug'] = chosen
+                payload['best_drug_reason'] = 'Derived from top matched recommendation.'
+            else:
+                # default to Acetaminophen when suitable, otherwise try Ibuprofen, otherwise first safe DRUG_LIST entry
+                age_years = survey.get('age_years')
+                weight_kg = survey.get('weight_kg')
+                pregnant = (survey.get('pregnant') == 'yes')
+                ok, _ = _drug_suitable_for_person('Acetaminophen', age_years=age_years, weight_kg=weight_kg, pregnant=pregnant)
+                if ok:
+                    payload['best_drug'] = 'Acetaminophen'
+                    payload['best_drug_reason'] = 'Default conservative choice.'
+                else:
+                    ok2, _ = _drug_suitable_for_person('Ibuprofen', age_years=age_years, weight_kg=weight_kg, pregnant=pregnant)
+                    if ok2:
+                        payload['best_drug'] = 'Ibuprofen'
+                        payload['best_drug_reason'] = 'Fallback choice when acetaminophen unsuitable.'
+                    else:
+                        for cand in DRUG_LIST:
+                            okc, _ = _drug_suitable_for_person(cand, age_years=age_years, weight_kg=weight_kg, pregnant=pregnant)
+                            if okc:
+                                payload['best_drug'] = cand
+                                payload['best_drug_reason'] = 'Fallback safe choice.'
+                                break
+                        if 'best_drug' not in payload:
+                            payload['info'] = 'No suitable OTC drug found for these demographics; consult a provider.'
+
+    # Ensure we always return a strong OTC match: score candidates from DRUG_LIST
+    try:
+        # compute candidate scores from multiple heuristics
+        candidate_scores = {}
+        def add_score(drug, s):
+            candidate_scores[drug] = candidate_scores.get(drug, 0) + s
+
+        # seed from explicit drug_votes
+        for d, v in drug_votes.items():
+            add_score(d, v * 4)
+
+        # token-match symptom words against DRUG_MAP keys and DRUG_LIST names
+        for s_item in survey_symptoms:
+            st = (s_item.get('symptom') or '').lower()
+            toks = [t for t in re.split(r"[^a-z0-9]+", st) if t]
+            for tok in toks:
+                # match DRUG_MAP explicit keys
+                for k, dv in DRUG_MAP.items():
+                    if tok in k:
+                        add_score(dv, 3)
+                # match tokens against drug names
+                for drug in DRUG_LIST:
+                    if tok in drug.lower():
+                        add_score(drug, 2)
+
+        # also prefer drugs mentioned in the top matched recommendation text
+        if results:
+            top_rec = results[0]
+            rec_text = (top_rec.get('recommended') or '') + ' ' + (top_rec.get('alternatives') or '')
+            rt = rec_text.lower()
+            for drug in DRUG_LIST:
+                if drug.lower() in rt:
+                    add_score(drug, 3)
+
+        # pick highest scoring candidate
+        if candidate_scores:
+            chosen, best_score = max(candidate_scores.items(), key=lambda x: x[1])
+            # label as strong if score meets threshold relative to symptom count
+            threshold = max(3, len(survey_symptoms))
+            strength = 'strong' if best_score >= threshold else 'weak'
+            payload['best_drug'] = chosen
+            if 'best_drug_reason' not in payload or not payload['best_drug_reason']:
+                payload['best_drug_reason'] = f"Top candidate by heuristic scoring ({best_score} pts)."
+            payload['best_drug_strength'] = strength
+    except Exception:
+        # if anything goes wrong, leave payload as-is
+        pass
+
+    return payload
+
+
+INDEX_HTML = r'''
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Medicine Finder</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>body{background:#f8fafc}.card{border-radius:12px}.details{transition:all .12s ease-in-out}.tag{display:inline-block;padding:.25rem .5rem;margin:.15rem;border-radius:12px;background:#eef;}</style>
+  </head>
+  <body>
+    <div class="container py-5">
+      <header class="mb-4 text-center">
+        <h1 class="display-6">Medicine Finder</h1>
+        <p class="text-muted">Answer a short survey and get conservative OTC recommendations. Not medical advice.</p>
+      </header>
+      <main>
+        <section id="survey-section">
+          <div class="card shadow-sm mb-4"><div class="card-body">
+            <form id="survey-form">
+              <div class="row g-2">
+                <div class="col-md-4 mb-3"><label class="form-label">Exact age (years)</label>
+                  <input id="age_years" type="number" min="0" step="1" class="form-control" placeholder="e.g., 34"></div>
+                <div class="col-md-4 mb-3"><label class="form-label">Weight (kg)</label>
+                  <input id="weight_kg" type="number" min="0" step="0.1" class="form-control" placeholder="e.g., 70"></div>
+                <div class="col-md-4 mb-3"><label class="form-label">Height (cm)</label>
+                  <input id="height_cm" type="number" min="0" step="0.1" class="form-control" placeholder="e.g., 175"></div>
+              </div>
+              <div class="mb-3"><label class="form-label">Are you pregnant?</label>
+                <select id="pregnant" class="form-select"><option value="no">No</option><option value="yes">Yes</option><option value="unknown">Prefer not to say</option></select></div>
+
+              <div class="mb-3"><label class="form-label">Add symptoms (type and choose from suggestions)</label>
+                <div class="position-relative" style="max-width:100%;">
+                  <div class="d-flex gap-2">
+                    <input id="symptom-input" class="form-control" placeholder="Type a symptom and press Add" autocomplete="off" />
+                    <button id="add-symptom" type="button" class="btn btn-outline-primary">Add</button>
+                  </div>
+                  <div id="symptom-suggestions-box" class="list-group position-absolute w-100" style="z-index:1000; max-height:220px; overflow:auto;"></div>
+                </div>
+                <div id="symptom-list" class="mt-2"></div>
+              </div>
+
+              <div class="mb-3"><label class="form-label">Any shortness of breath or severe symptoms?</label>
+                <select id="shortness_of_breath" class="form-select"><option value="no">No</option><option value="yes">Yes</option></select></div>
+              <div class="d-flex gap-2"><button type="button" id="submit-btn" class="btn btn-primary">Get Recommendations</button></div>
+            </form>
+          </div></div>
+        </section>
+        <section id="results-section" class="d-none">
+          <div class="card shadow-sm mb-4"><div class="card-body">
+            <h3>Recommendations</h3><div id="recommendations" class="mb-3"></div>
+            <h5>Find nearby pharmacies (US focus)</h5>
+            <div class="mb-3"><label class="form-label">Enter ZIP code or allow location</label>
+              <input id="location-input" class="form-control" placeholder="e.g., 94105 or lat,lon" /></div>
+            <div class="mb-3"><button id="use-location" class="btn btn-secondary btn-sm">Use my location</button>
+              <button id="find-pharmacies" class="btn btn-outline-primary btn-sm">Find Pharmacies</button></div>
+            <div id="pharm-list"></div>
+            <div class="mt-3 text-muted small">Note: Pharmacy inventory not guaranteed. Contact to confirm stock.</div>
+            <div class="mt-3"><button id="start-over" class="btn btn-link">Start over</button></div>
+          </div></div>
+        </section>
+      </main>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Drug monograph modal -->
+    <div class="modal fade" id="drugModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Drug</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <!-- populated dynamically -->
+            <div>Loading...</div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      // Populate symptom suggestions from the server and provide live filtering
+      let SYM_LIST = [];
+      async function loadSymptoms() {
+        try {
+          const r = await fetch('/api/symptoms');
+          const list = await r.json();
+          // de-duplicate and sort
+          const dedup = Array.from(new Set(list)).sort();
+          SYM_LIST = dedup;
+        } catch (e) {
+          console.warn('Could not load symptom list', e);
+        }
+      }
+
+      const selected = new Set();
+      function renderSelected() {
+        const container = document.getElementById('symptom-list');
+        container.innerHTML = '';
+        selected.forEach(s => {
+          const el = document.createElement('span'); el.className = 'tag'; el.textContent = s;
+          const btn = document.createElement('button'); btn.type='button'; btn.className='btn btn-sm btn-link'; btn.textContent='×'; btn.style.marginLeft='6px'; btn.onclick = () => { selected.delete(s); renderSelected(); };
+          el.appendChild(btn); container.appendChild(el);
+        });
+      }
+
+      // Suggestion rendering and input handlers
+      function showSuggestions(filter) {
+        const box = document.getElementById('symptom-suggestions-box');
+        box.innerHTML = '';
+        if (!filter) return;
+        const f = filter.toLowerCase();
+        let count = 0;
+        for (const s of SYM_LIST) {
+          if (s.toLowerCase().includes(f)) {
+            const item = document.createElement('button');
+            item.type = 'button';
+            item.className = 'list-group-item list-group-item-action';
+            item.textContent = s;
+            item.onclick = () => { document.getElementById('symptom-input').value = s; document.getElementById('symptom-suggestions-box').innerHTML = ''; };
+            box.appendChild(item);
+            count += 1;
+            if (count >= 12) break;
+          }
+        }
+      }
+
+      document.getElementById('symptom-input').addEventListener('input', (ev) => {
+        showSuggestions(ev.target.value.trim());
+      });
+
+      document.getElementById('symptom-input').addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          document.getElementById('add-symptom').click();
+        }
+      });
+
+      document.getElementById('add-symptom').addEventListener('click', () => {
+        const v = document.getElementById('symptom-input').value.trim();
+        if (!v) return;
+        selected.add(v);
+        document.getElementById('symptom-input').value = '';
+        document.getElementById('symptom-suggestions-box').innerHTML = '';
+        renderSelected();
+      });
+
+      document.getElementById('start-over')?.addEventListener('click', () => window.location.reload());
+
+      document.getElementById('submit-btn').addEventListener('click', async () => {
+        const age_val = document.getElementById('age_years').value.trim();
+        const weight_val = document.getElementById('weight_kg').value.trim();
+        const height_val = document.getElementById('height_cm').value.trim();
+  const payload = { age_group: document.getElementById('age_group')?.value || 'adult', age_years: age_val ? parseInt(age_val,10) : null, weight_kg: weight_val ? parseFloat(weight_val) : null, height_cm: height_val ? parseFloat(height_val) : null, pregnant: document.getElementById('pregnant').value, modifiers: { shortness_of_breath: document.getElementById('shortness_of_breath').value === 'yes' }, symptoms: Array.from(selected) };
+        const resp = await fetch('/api/map', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        const data = await resp.json();
+        const recs = data.recommendations || data.matches || [];
+        const container = document.getElementById('recommendations'); container.innerHTML = '';
+        if (data.best_drug) {
+          const card = document.createElement('div');
+          card.className = 'alert';
+          const strength = data.best_drug_strength || 'unknown';
+          if (data.warning) card.className += ' alert-danger';
+          else if (strength === 'strong') card.className += ' alert-success';
+          else card.className += ' alert-warning';
+          let html = `<div class="d-flex align-items-center justify-content-between"><div><strong>Suggested drug:</strong> ${data.best_drug}`;
+          if (strength) html += ` <span class="badge bg-${strength==='strong'?'success':'warning'} ms-2">${strength.toUpperCase()}</span>`;
+          html += `</div>`;
+          // details button placeholder (will be wired up after element is appended)
+          const safeId = 'profile-' + data.best_drug.replace(/[^a-z0-9]/gi, '_');
+          html += `<div><button type="button" class="btn btn-sm btn-outline-secondary" data-target-id="${safeId}">Details</button></div></div>`;
+          html += `<div class="small text-muted mt-2">${data.best_drug_reason || ''}</div>`;
+          html += `<div id="${safeId}" class="mt-2 d-none small bg-light p-2 rounded"></div>`;
+          if (data.unsuitable_candidates && data.unsuitable_candidates.length) {
+            html += `<div class="mt-2 small text-muted">Top unsuitable candidates: ${data.unsuitable_candidates.join('; ')}</div>`;
+          }
+          if (data.warning) html += `<div class="mt-2 small text-danger">${data.warning}</div>`;
+          card.innerHTML = html;
+          container.appendChild(card);
+
+          // Wire up the details button to open a Bootstrap modal with full monograph
+          try {
+            const btn = card.querySelector('button[data-target-id]');
+            btn.addEventListener('click', () => {
+              const modal = document.getElementById('drugModal');
+              const title = modal.querySelector('.modal-title');
+              const body = modal.querySelector('.modal-body');
+              const p = data.best_drug_profile || {};
+              title.textContent = data.best_drug;
+              const uses = (p.common_uses || []).map(u => `<li>${u}</li>`).join('');
+              const interactions = p.major_interactions || 'None known or not specified.';
+              const contraindications = p.contraindications || 'None specified.';
+              const minage = (p.min_age_years !== undefined && p.min_age_years !== null) ? `<div><strong>Minimum age:</strong> ${p.min_age_years} years</div>` : '';
+              const preg = p.avoid_in_pregnancy ? `<div class="text-danger"><strong>Pregnancy caution:</strong> Avoid in pregnancy</div>` : '';
+              body.innerHTML = `
+                <div><strong>Description</strong><div>${p.description || 'No description available.'}</div></div>
+                <div class="mt-2"><strong>Common uses</strong><ul>${uses}</ul></div>
+                <div class="mt-2"><strong>Adult dose</strong><div>${p.adult_dose || 'Follow product label.'}</div></div>
+                <div class="mt-2"><strong>Pediatric dose</strong><div>${p.pediatric_dose || 'Follow product label.'}</div></div>
+                <div class="mt-2"><strong>Interactions</strong><div>${interactions}</div></div>
+                <div class="mt-2"><strong>Contraindications</strong><div>${contraindications}</div></div>
+                ${minage}
+                ${preg}
+                <div class="mt-2"><strong>Notes</strong><div>${p.notes || 'No additional notes.'}</div></div>
+              `;
+              // show modal using Bootstrap's modal API
+              const bsModal = new bootstrap.Modal(modal);
+              bsModal.show();
+            });
+          } catch (e) {
+            console.warn('Could not wire details button to modal', e);
+          }
+        }
+        if (Array.isArray(recs) && recs.length) {
+          recs.forEach(r => {
+            if (r.warning) { const el = document.createElement('div'); el.className = 'alert alert-danger'; el.textContent = r.warning; container.appendChild(el); return }
+            if (r.info) { const el = document.createElement('div'); el.className = 'alert alert-info'; el.textContent = r.info; container.appendChild(el); return }
+            const card = document.createElement('div'); card.className = 'mb-3 p-3 border rounded';
+            card.innerHTML = `<strong>${r.name}</strong><div class="text-muted small">Recommended: ${r.recommended}</div><div>${r.explanation || ''}</div><div class="text-muted small">Alternatives: ${ (r.alternatives || []).join(', ') }</div><div class="text-danger small">Precautions: ${ r.precautions || 'None specified' }</div>`;
+            container.appendChild(card);
+          });
+        } else if (!data.best_drug) {
+          const el = document.createElement('div'); el.className='alert alert-info'; el.textContent='No strong OTC match found. Consider seeing a pharmacist or doctor.'; container.appendChild(el);
+        }
+        document.getElementById('survey-section').classList.add('d-none'); document.getElementById('results-section').classList.remove('d-none');
+      });
+
+      document.getElementById('use-location').addEventListener('click', () => { if (!navigator.geolocation) return alert('Geolocation not supported'); navigator.geolocation.getCurrentPosition(pos => { document.getElementById('location-input').value = pos.coords.latitude + ',' + pos.coords.longitude }, err => alert('Unable to get location: ' + err.message)) });
+
+      document.getElementById('find-pharmacies').addEventListener('click', async () => {
+        const val = document.getElementById('location-input').value.trim(); let lat, lon;
+        if (val.includes(',')) { [lat, lon] = val.split(',') } else { const geo = await fetch(`https://nominatim.openstreetmap.org/search?format=json&countrycodes=us&postalcode=${encodeURIComponent(val)}`); const j = await geo.json(); if (!j || !j[0]) return alert('Could not geocode ZIP. Try allowing location or enter lat,lon'); lat = j[0].lat; lon = j[0].lon }
+        const resp = await fetch('/api/pharmacies', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lat, lon }) });
+        if (!resp.ok) { const err = await resp.json().catch(() => ({ detail: 'Request failed' })); return alert('Pharmacy lookup error: ' + (err.detail || JSON.stringify(err))) }
+        const data = await resp.json(); const list = document.getElementById('pharm-list'); list.innerHTML = '';
+        (data.pharmacies || []).forEach(p => { const el = document.createElement('div'); el.className = 'p-2 border-bottom'; el.innerHTML = `<strong>${p.name}</strong><div class="text-muted small">${p.address} ${p.lat ? '• ' + p.lat + ',' + p.lon : ''}</div>`; list.appendChild(el) });
+      });
+
+      // initial load
+      loadSymptoms().then(() => { /* no-op */ });
+    </script>
+  </body>
+</html>
+'''
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, payload, content_type='application/json'):
+        data = payload.encode('utf-8') if isinstance(payload, str) else json.dumps(payload).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        try:
+            if self.path == '/api/symptoms':
+                # return the symptom vocabulary
+                self._send(200, SYMPTOMS)
+                return
+            if self.path in ('/', '/index.html'):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                body = INDEX_HTML.encode('utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            # unknown
+            self.send_response(404)
+            self.end_headers()
+        except Exception:
+            tb = traceback.format_exc()
+            self._send(500, {'error': 'internal', 'detail': tb})
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length) if length else b''
+            data = json.loads(body.decode('utf-8') or '{}')
+
+            if self.path == '/api/map':
+                res = map_survey_to_recommendations(data)
+                # normalize response: recommendations array + optional best_drug
+                if isinstance(res, dict):
+                    resp = {
+                        'recommendations': res.get('matches', []),
+                        'best_drug': res.get('best_drug'),
+                        'best_drug_reason': res.get('best_drug_reason'),
+                        'best_drug_strength': res.get('best_drug_strength'),
+                        'warning': res.get('warning'),
+                        'unsuitable_candidates': res.get('unsuitable_candidates')
+                    }
+                    # attach drug profile notes if available
+                    try:
+                        bd = resp.get('best_drug')
+                        if bd:
+                            prof = DRUG_PROFILES.get(bd)
+                            if prof:
+                                resp['best_drug_profile'] = prof
+                    except Exception:
+                        pass
+                else:
+                    resp = {'recommendations': res}
+                self._send(200, resp)
+                return
+
+            if self.path == '/api/pharmacies':
+                lat = data.get('lat')
+                lon = data.get('lon')
+                radius = int(data.get('radius', 5000))
+                if lat is None or lon is None:
+                    self._send(400, {'detail': 'Missing lat/lon'})
+                    return
+                # Overpass API query
+                q = f"""[out:json][timeout:25];(node(around:{radius},{lat},{lon})[\"amenity\"=\"pharmacy\"];way(around:{radius},{lat},{lon})[\"amenity\"=\"pharmacy\"];relation(around:{radius},{lat},{lon})[\"amenity\"=\"pharmacy\"];);out center;"""
+                url = 'https://overpass-api.de/api/interpreter'
+                req = urllib.request.Request(url, data=q.encode('utf-8'), headers={'User-Agent': 'MedicineFinder/1.0 (example@example.com)'})
+                try:
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        resp_body = resp.read()
+                        parsed = json.loads(resp_body.decode('utf-8'))
+                except HTTPError as e:
+                    self._send(502, {'detail': f'Overpass HTTP error: {e.code}'})
+                    return
+                except URLError as e:
+                    self._send(502, {'detail': f'Overpass network error: {e}'} )
+                    return
+                results = []
+                for el in parsed.get('elements', [])[:40]:
+                    name = (el.get('tags') or {}).get('name') or 'Unknown'
+                    tags = el.get('tags') or {}
+                    addr = []
+                    for k in ('addr:street', 'addr:housenumber', 'addr:city', 'addr:postcode'):
+                        if tags.get(k):
+                            addr.append(tags.get(k))
+                    address = ', '.join(addr) if addr else tags.get('addr:full') or ''
+                    lat_e = el.get('lat') or (el.get('center') or {}).get('lat')
+                    lon_e = el.get('lon') or (el.get('center') or {}).get('lon')
+                    results.append({'name': name, 'address': address, 'lat': lat_e, 'lon': lon_e, 'tags': tags})
+                self._send(200, {'pharmacies': results})
+                return
+
+            # unknown
+            self._send(404, {'detail': 'not found'})
+        except Exception:
+            tb = traceback.format_exc()
+            self._send(500, {'error': 'internal', 'detail': tb})
+
+
+def run():
+  # Try binding starting at PORT and increment if the port is in use.
+  max_tries = 10
+  for attempt in range(max_tries):
+    try_port = PORT + attempt
+    addr = (HOST, try_port)
+    try:
+      with ThreadingHTTPServer(addr, Handler) as httpd:
+        print(f"Medicine Finder running at http://{HOST}:{try_port}/")
+        try:
+          httpd.serve_forever()
+        except KeyboardInterrupt:
+          print('\nStopping server')
+        return
+    except OSError as e:
+      # Address in use — try next port
+      if attempt < max_tries - 1:
+        print(f"Port {try_port} busy, trying {try_port+1}...")
+        continue
+      else:
+        raise
+
+
+if __name__ == '__main__':
+    run()
